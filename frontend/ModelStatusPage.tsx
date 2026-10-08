@@ -17,13 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { RefreshCw, Eye } from 'lucide-react'
-import { useState } from 'react'
+import { RefreshCw } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { PublicLayout } from '@/components/layout'
+import { Main, PublicLayout } from '@/components/layout'
 import { PageTransition } from '@/components/page-transition'
-import { Dialog } from '@/components/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { api } from '@/lib/api'
 
@@ -36,7 +35,6 @@ interface StatusChannel {
   status: number
   response_time: number
   test_time: number
-  test_error: string
 }
 
 interface StatusModel {
@@ -113,9 +111,17 @@ function timeAgo(unix: number): string {
 
 // API
 
-async function fetchModelStatus(): Promise<StatusPayload | undefined> {
-  const res = await api.get('/api/model-status')
-  return res.data?.data as StatusPayload | undefined
+async function fetchModelStatus(): Promise<
+  { data?: StatusPayload; status: number } | undefined
+> {
+  try {
+    const res = await api.get('/api/model-status')
+    return { data: res.data?.data as StatusPayload | undefined, status: res.status }
+  } catch (error: unknown) {
+    const status = (error as { response?: { status?: number } })?.response
+      ?.status
+    return { data: undefined, status: status ?? 0 }
+  }
 }
 
 // Timeline bars
@@ -138,9 +144,17 @@ function Timeline({ bars }: { bars: TimelineBar[] }) {
 // Page
 
 export function ModelStatusPage() {
+  return <StatusContent layout='public' />
+}
+
+// 控制台内的状态页（侧边栏 常规 分组入口）
+export function StatusConsole() {
+  return <StatusContent layout='console' />
+}
+
+function StatusContent({ layout }: { layout: 'public' | 'console' }) {
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState<string | null>(null)
-  const [errorDialog, setErrorDialog] = useState<{ open: boolean; title: string; content: string }>({ open: false, title: '', content: '' })
   const [refreshSec, setRefreshSec] = useState(30)
 
   const query = useQuery({
@@ -149,23 +163,51 @@ export function ModelStatusPage() {
     refetchInterval: refreshSec * 1000,
   })
 
-  // 从首次响应里读取自动刷新设置
-  const payload = query.data
-  if (payload && payload.auto_refresh !== undefined) {
-    const next = payload.auto_refresh ? payload.auto_refresh_interval : false
-    const nextSec = typeof next === 'number' ? next : 30
-    if (nextSec !== refreshSec && next !== false) setRefreshSec(nextSec)
-    if (payload.auto_refresh === false && refreshSec !== 0) setRefreshSec(0)
+  const payload = query.data?.data
+  const fetchStatus = query.data?.status
+
+  // 按后台设置调节自动刷新间隔（放 effect 里，避免渲染期间 setState）
+  useEffect(() => {
+    if (!payload || payload.auto_refresh === undefined) return
+    if (payload.auto_refresh === false) {
+      setRefreshSec(0)
+      return
+    }
+    const nextSec = payload.auto_refresh_interval || 30
+    setRefreshSec((cur) => (cur === nextSec ? cur : nextSec))
+  }, [payload?.auto_refresh, payload?.auto_refresh_interval, payload])
+
+  if (fetchStatus === 404) {
+    const closed = (
+      <PageTransition
+        className={`mx-auto w-full max-w-[900px] px-3 pb-10 sm:px-6 sm:pb-12 ${layout === 'public' ? 'pt-12 sm:pt-16' : ''}`}
+      >
+        <div className='rounded-lg border px-6 py-12 text-center'>
+          <p className='text-muted-foreground text-sm'>状态页未开启</p>
+        </div>
+      </PageTransition>
+    )
+    if (layout === 'console') {
+      return (
+        <Main>
+          <div className='min-h-0 flex-1 overflow-auto px-3 py-4 sm:px-6 sm:py-6'>
+            {closed}
+          </div>
+        </Main>
+      )
+    }
+    return <PublicLayout showMainContainer={false}>{closed}</PublicLayout>
   }
 
   const bars = payload?.bars ?? []
   const groups = payload?.groups ?? []
   const uptime = payload?.uptime_pct ?? 100
 
-  return (
-    <PublicLayout showMainContainer={false}>
-      <PageTransition className='mx-auto w-full max-w-[900px] space-y-4 px-3 pt-12 pb-10 sm:px-6 sm:pt-16 sm:pb-12'>
-        {/* ======== Title bar ======== */}
+  const body = (
+    <PageTransition
+      className={`mx-auto w-full max-w-[900px] space-y-4 px-3 pb-10 sm:px-6 sm:pb-12 ${layout === 'public' ? 'pt-12 sm:pt-16' : ''}`}
+    >
+      {/* ======== Title bar ======== */}
         <div className='flex items-center justify-between'>
           <h1 className='text-base font-semibold tracking-tight sm:text-lg'>
             {t('Service Status')}
@@ -345,9 +387,6 @@ export function ModelStatusPage() {
                                           <th className='px-2 py-1 text-right font-medium'>
                                             最近测试
                                           </th>
-                                          <th className='px-2 py-1 text-center font-medium'>
-                                            错误
-                                          </th>
                                         </tr>
                                       </thead>
                                       <tbody>
@@ -372,26 +411,6 @@ export function ModelStatusPage() {
                                             <td className='text-muted-foreground px-2 py-1 text-right'>
                                               {timeAgo(ch.test_time)}
                                             </td>
-                                            <td className='px-2 py-1 text-center'>
-                                              {ch.test_error ? (
-                                                <button
-                                                  type='button'
-                                                  className='text-primary hover:underline inline-flex items-center gap-0.5 text-xs'
-                                                  onClick={() =>
-                                                    setErrorDialog({
-                                                      open: true,
-                                                      title: `#${ch.id}${ch.display_name ? ` ${ch.display_name}` : ''} 测试错误`,
-                                                      content: ch.test_error,
-                                                    })
-                                                  }
-                                                >
-                                                  <Eye className='h-3 w-3' />
-                                                  查看
-                                                </button>
-                                              ) : (
-                                                <span className='text-muted-foreground/50'>—</span>
-                                              )}
-                                            </td>
                                           </tr>
                                         ))}
                                       </tbody>
@@ -413,19 +432,17 @@ export function ModelStatusPage() {
         <p className='text-muted-foreground/60 text-center text-[11px]'>
           {t('Status is computed from channel availability and refreshes every 60s')}
         </p>
-
-        {/* 错误详情弹窗 */}
-        <Dialog
-          open={errorDialog.open}
-          onOpenChange={(open) => setErrorDialog({ ...errorDialog, open })}
-          title={errorDialog.title}
-          contentClassName='sm:max-w-lg'
-        >
-          <pre className='bg-muted/50 max-h-[300px] overflow-auto whitespace-pre-wrap rounded-md border p-3 text-xs'>
-            {errorDialog.content}
-          </pre>
-        </Dialog>
       </PageTransition>
-    </PublicLayout>
   )
+
+  if (layout === 'console') {
+    return (
+      <Main>
+        <div className='min-h-0 flex-1 overflow-auto px-3 py-4 sm:px-6 sm:py-6'>
+          {body}
+        </div>
+      </Main>
+    )
+  }
+  return <PublicLayout showMainContainer={false}>{body}</PublicLayout>
 }
