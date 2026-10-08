@@ -19,7 +19,6 @@ type statusChannelItem struct {
 	Status       int    `json:"status"`
 	ResponseTime int    `json:"response_time"`
 	TestTime     int64  `json:"test_time"`
-	TestError    string `json:"test_error"`
 }
 
 type statusModelItem struct {
@@ -62,14 +61,27 @@ func classify(total, enabled int) string {
 // GetModelStatus 公开状态页数据：按分组聚合模型可用性 + 每个模型 60 小时时间轴。
 // 时间轴从 logs 表聚合：按 model_name 分组，每小时有消费日志=正常，有错误日志=故障。
 func GetModelStatus(c *gin.Context) {
+	// 总开关：管理员也遵循开关；关了之后接口直接 404（页面同样不渲染内容）
+	if !model.StatusPageEnabled() {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "状态页未开启"})
+		return
+	}
 	type abilityRow struct {
 		Group   string
 		Model   string
 		Channel int
 		Enabled bool
 	}
+	hideDisabled := model.StatusPageHideDisabledChannels()
 	var rows []abilityRow
-	if err := model.DB.Table("abilities").
+	// 只取渠道仍存在的 ability 行：渠道删除后可能残留孤儿数据，
+	// INNER JOIN channels 后不存在的渠道 id 自然被过滤掉。
+	abilityQuery := model.DB.Table("abilities").
+		Joins("INNER JOIN channels ON channels.id = abilities.channel_id")
+	if hideDisabled {
+		abilityQuery = abilityQuery.Where("channels.status = ?", common.ChannelStatusEnabled)
+	}
+	if err := abilityQuery.
 		Select("abilities.`group` AS `group`, abilities.model AS model, abilities.channel_id AS channel, abilities.enabled AS enabled").
 		Find(&rows).Error; err != nil {
 		common.ApiError(c, err)
@@ -150,7 +162,6 @@ func GetModelStatus(c *gin.Context) {
 					Status:       ch.Status,
 					ResponseTime: ch.ResponseTime,
 					TestTime:     ch.TestTime,
-					TestError:    ch.TestError,
 				})
 			}
 		}
@@ -207,6 +218,39 @@ func GetModelStatus(c *gin.Context) {
 		}
 		if r.Type == int(model.LogTypeError) {
 			a.errors += r.Count
+		}
+	}
+
+	// 渠道探测结果也计入时间轴：探测失败（test_error 非空且 test_time 在窗口内）
+	// 按渠道的模型列表归入对应小时，作为错误信号补充（错误日志可能被关闭）。
+	type probeRow struct {
+		Models   string
+		TestTime int64
+	}
+	var probeRows []probeRow
+	if err := model.DB.Model(&model.Channel{}).
+		Select("models", "test_time").
+		Where("test_error <> '' AND test_time >= ?", startTs).
+		Find(&probeRows).Error; err == nil {
+		for _, pr := range probeRows {
+			hour := (pr.TestTime / 3600) * 3600
+			for _, mn := range strings.Split(pr.Models, ",") {
+				mn = strings.TrimSpace(mn)
+				if mn == "" {
+					continue
+				}
+				m := modelHourMap[mn]
+				if m == nil {
+					m = map[int64]*modelHourAgg{}
+					modelHourMap[mn] = m
+				}
+				a := m[hour]
+				if a == nil {
+					a = &modelHourAgg{}
+					m[hour] = a
+				}
+				a.errors++
+			}
 		}
 	}
 
@@ -301,12 +345,60 @@ func GetModelStatus(c *gin.Context) {
 		uptimePct = float64(opHours) / float64(len(allBars)) * 100
 	}
 
-	// 组装结果：每个模型附带自己的时间轴
+	// 最近 10 分钟各模型的错误数与成功数：渠道状态正常但请求在持续失败时，
+	// 依据实时错误率把模型标为异常（不依赖渠道自动禁用开关）。
+	type recentRow struct {
+		ModelName string
+		Type      int
+		Count     int64
+	}
+	var recentRows []recentRow
+	recentSince := now.Add(-10 * time.Minute).Unix()
+	if err := queryDB.Model(&model.Log{}).
+		Select("model_name, type, COUNT(*) AS count").
+		Where("created_at >= ? AND model_name <> ''", recentSince).
+		Group("model_name, type").
+		Find(&recentRows).Error; err != nil {
+		model.DB.Model(&model.Log{}).
+			Select("model_name, type, COUNT(*) AS count").
+			Where("created_at >= ? AND model_name <> ''", recentSince).
+			Group("model_name, type").
+			Find(&recentRows)
+	}
+	type recentAgg struct {
+		ok     int64
+		errors int64
+	}
+	recentMap := map[string]*recentAgg{}
+	for _, r := range recentRows {
+		a := recentMap[r.ModelName]
+		if a == nil {
+			a = &recentAgg{}
+			recentMap[r.ModelName] = a
+		}
+		if r.Type == int(model.LogTypeConsume) {
+			a.ok += r.Count
+		}
+		if r.Type == int(model.LogTypeError) {
+			a.errors += r.Count
+		}
+	}
+
+	// 组装结果：每个模型附带自己的时间轴；渠道全启用时再看实时错误率，
+	// 最近 10 分钟错误数 >= 5 且错误占比 > 30% 视为异常（degraded）。
 	groups := make([]statusGroupItem, 0, len(groupMap))
 	for g, models := range groupMap {
 		gStatus := "operational"
 		for i := range models {
 			models[i].Bars = generateBars(models[i].Model)
+			if models[i].Status == "operational" {
+				if ra := recentMap[models[i].Model]; ra != nil && ra.errors >= 5 {
+					total := ra.ok + ra.errors
+					if total > 0 && float64(ra.errors)/float64(total) > 0.3 {
+						models[i].Status = "degraded"
+					}
+				}
+			}
 			if models[i].Status == "outage" {
 				gStatus = "outage"
 			} else if models[i].Status == "degraded" || models[i].Status == "none" {
@@ -337,6 +429,7 @@ func GetModelStatus(c *gin.Context) {
 			"uptime_pct":           uptimePct,
 			"auto_refresh":         model.StatusPageAutoRefreshEnabled(),
 			"auto_refresh_interval": model.StatusPageAutoRefreshInterval(),
+			"hide_disabled_channels": hideDisabled,
 		},
 	})
 }
